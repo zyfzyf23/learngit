@@ -1,0 +1,214 @@
+#writer.py thread,修改
+import re
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from APIModel import APIModel
+from typing import List
+from prompts import SUBSECTION_WRITING_PROMPT,LCE_PROMPT
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, List, Any
+
+import os
+import threading
+import numpy as np
+from tqdm import trange,tqdm
+import time
+import copy
+
+class subsectionWriter():
+    
+    def __init__(self, model:str, api_key:str, api_url:str) -> None:
+        
+        self.model, self.api_key, self.api_url = model, api_key, api_url
+        self.api_model = APIModel(self.model, self.api_key, self.api_url)
+        self.chat_model = ChatOpenAI(base_url=self.api_url, model=self.model, api_key=self.api_key)
+        self.token_counter = None  # 可以根据需要添加 Token 计数器
+        self.input_token_usage, self.output_token_usage = 0, 0
+    
+    def write(self, topic, outline, subsection_len = 500, refining = True, reflection=True):
+        #refining（默认值 True）：是否对生成的报告进行细化。reflection（默认值 True）：是否在生成子章节时进行“反思”式的增强处理。
+        #解析大纲
+        parsed_outline = self.parse_outline(outline=outline)
+        #section_content = [[]] * len(parsed_outline['sections'])
+        section_content = [[] for _ in range(len(parsed_outline['sections']))]
+        
+        #为每个章节启动一个线程，用 self.write_subsection_with_reflection 来生成该子章节的内容。每个线程的任务是根据给定的章节文本、主题、大纲等信息，调用相关方法生成子章节内容。
+        thread_l = []
+        for i in range(len(parsed_outline['sections'])):
+            thread = threading.Thread(target=self.write_subsection_with_reflection, args=(topic, outline, parsed_outline['sections'][i], parsed_outline['subsections'][i], parsed_outline['subsection_descriptions'][i], section_content, i))
+            thread_l.append(thread)
+            thread.start()
+            time.sleep(0.1)
+        for thread in thread_l:
+            thread.join()#阻塞调用，它会让主线程等待每个子线程完成工作。具体来说，主线程会暂停执行，直到每个线程执行结束。
+        
+        
+        #使用 self.generate_document 方法根据生成的章节内容 section_content 和大纲 parsed_outline 生成原始的报告 raw_survey。
+        raw_survey = self.generate_document(parsed_outline, section_content)
+        
+        if refining:
+            final_section_content = self.refine_subsections(topic, outline, section_content)
+            refined_survey = self.generate_document(parsed_outline, final_section_content)
+            return raw_survey+'\n',refined_survey+'\n'#, mindmap
+        else:
+            return raw_survey+'\n'#, mindmap
+        
+    def refine_subsections(self, topic, outline, section_content):
+        section_content_even = [[y for y in x] for x in section_content] 
+
+        thread_l = []
+        for i in range(len(section_content_even)):
+            for j in range(len(section_content_even[i])):
+                if j % 2 == 0:
+                    if len(section_content_even[i]) == 1:  # 处理只有一个 subsection 的情况
+                        contents = [''] + section_content_even[i] + ['']
+                    elif j == 0:
+                        contents = [''] + section_content_even[i][:2]
+                    elif j == (len(section_content_even[i]) - 1):
+                        contents = section_content_even[i][-2:] + ['']
+                    else:
+                        contents = section_content_even[i][j-1:j+2]
+                    thread = threading.Thread(target=self.lce, args=(topic, outline, contents, section_content_even[i], j))
+                    thread_l.append(thread)
+                    thread.start()
+        for thread in thread_l:
+            thread.join()
+
+
+        final_section_content = [[y for y in x] for x in section_content_even] 
+
+        thread_l = []
+        for i in range(len(final_section_content)):
+            for j in range(len(final_section_content[i])):
+                if j % 2 == 1:
+                    if j == (len(final_section_content[i]) - 1):
+                        contents = final_section_content[i][-2:] + ['']
+                    else:
+                        contents = final_section_content[i][j-1:j+2]
+                    thread = threading.Thread(target=self.lce, args=(topic, outline, contents, final_section_content[i], j))
+                    thread_l.append(thread)
+                    thread.start()
+        for thread in thread_l:
+            thread.join()
+        
+        return final_section_content
+    
+    #撰写某个章节内容
+    def write_subsection_with_reflection(self, topic, outline, section, subsections, subdescriptions, res_l, idx):
+        
+        prompts = []
+        for j in range(len(subsections)):#分别撰写子章节内容
+            subsection = subsections[j]
+            description = subdescriptions[j]
+
+            prompt = self.__generate_prompt(SUBSECTION_WRITING_PROMPT, paras={'OVERALL OUTLINE': outline,'SUBSECTION NAME': subsection,'DESCRIPTION':description,'TOPIC':topic, 'SECTION NAME':section})
+            prompts.append(prompt)
+        
+        # 存放生成的某个章节内容
+        contents = []
+        subsection_prompt = ChatPromptTemplate.from_messages([
+            MessagesPlaceholder(variable_name="question")]
+        )
+        prompt_chain = subsection_prompt | self.chat_model | StrOutputParser()
+
+        for i,p in enumerate(prompts):
+            sub_content_chunk = ""  # 用于存放当前的子章节内容
+            subsection_message = [HumanMessage(content=p)]
+            for sub_content_part in prompt_chain.stream({"question": subsection_message}):
+                print(sub_content_part, end="", flush=True)
+                sub_content_chunk += sub_content_part
+
+            contents.append(sub_content_chunk) 
+        
+        contents = [c.replace('<format>','').replace('</format>','') for c in contents]
+    
+        res_l[idx] = contents
+        return contents
+        
+    def __generate_prompt(self, template, paras):
+        prompt = template
+        for k in paras.keys():
+            prompt = prompt.replace(f'[{k}]', paras[k])
+        return prompt
+    
+    def generate_prompt(self, template, paras):
+        prompt = template
+        for k in paras.keys():
+            prompt = prompt.replace(f'[{k}]', paras[k])
+        return prompt
+    
+    def lce(self, topic, outline, contents, res_l, idx):#contents：当前子章节的内容，列表形式。contents[0] 是前一个子章节，contents[1] 是当前要优化的子章节内容，contents[2] 是下一个子章节内容。res_l：用来存储返回结果的列表，函数将在此列表中存储细化后的子章节内容。idx：当前子章节在 res_l 中的位置，指定将细化后的内容存储在列表中的哪个位置。
+        
+        prompt = self.__generate_prompt(LCE_PROMPT, paras={'OVERALL OUTLINE': outline,'PREVIOUS': contents[0],\
+                                                                          'FOLLOWING':contents[2],'TOPIC':topic,'SUBSECTION':contents[1]})
+                
+        subsection_message = [HumanMessage(content=prompt)]
+        # 创建提示模板并运行模型响应
+        prompt = ChatPromptTemplate.from_messages([
+            MessagesPlaceholder(variable_name="question")]
+        )
+
+        prompt_chain = prompt | self.chat_model | StrOutputParser()
+        
+        refined_content=""
+        for refine_part in prompt_chain.stream({"question": subsection_message}):
+            print(refine_part, end="", flush=True)
+            refined_content += refine_part  # 将生成的部分拼接在一起
+        #refined_content = refined_content.replace('<format>','').replace('</format>','')
+        refined_content=refined_content.split('<format>')[1].split('</format>')[0]
+        res_l[idx] = refined_content
+        return refined_content
+        #return refined_content.replace('Here is the refined subsection:\n','')
+
+    def parse_outline(self, outline):
+        result = {
+            "title": "",
+            "sections": [],
+            "section_descriptions": [],
+            "subsections": [],
+            "subsection_descriptions": []
+        }
+    
+        # Split the outline into lines
+        lines = outline.split('\n')
+        
+        for i, line in enumerate(lines):
+            # Match title, sections, subsections and their descriptions
+            if line.startswith('# '):
+                result["title"] = line[2:].strip()
+            elif line.startswith('## '):
+                result["sections"].append(line[3:].strip())
+                # Extract the description in the next line
+                if i + 1 < len(lines) and lines[i + 1].startswith('Description:'):
+                    result["section_descriptions"].append(lines[i + 1].split('Description:', 1)[1].strip())
+                    result["subsections"].append([])
+                    result["subsection_descriptions"].append([])
+            elif line.startswith('### '):
+                if result["subsections"]:
+                    result["subsections"][-1].append(line[4:].strip())
+                    # Extract the description in the next line
+                    if i + 1 < len(lines) and lines[i + 1].startswith('Description:'):
+                        result["subsection_descriptions"][-1].append(lines[i + 1].split('Description:', 1)[1].strip())
+
+        return result
+
+    def generate_document(self, parsed_outline, subsection_contents):
+        #根据解析过的大纲（parsed_outline）和章节内容（subsection_contents）生成一个文档。该文档是以 Markdown 格式组织的，包含标题、章节、子章节及其对应的内容。
+        document = []
+        
+        title = parsed_outline['title']
+        document.append(f"# {title}\n")
+        
+        # 遍历章节
+        for i, section in enumerate(parsed_outline['sections']):
+            document.append(f"## {section}\n")
+            if i < len(subsection_contents) and subsection_contents[i]: # 检查 subsection_contents[i] 是否存在
+                for j, subsection in enumerate(parsed_outline['subsections'][i]):
+                    document.append(f"### {subsection}\n")
+                    if j < len(subsection_contents[i]): # 检查 j 是否在有效范围内
+                        document.append(subsection_contents[i][j] + "\n")
+        
+        return "\n".join(document)
