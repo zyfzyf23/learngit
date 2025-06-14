@@ -1,2 +1,3 @@
 hello git
-feature1 修改
+=merge
+feature2第一次提交
